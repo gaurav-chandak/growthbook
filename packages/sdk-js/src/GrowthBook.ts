@@ -14,16 +14,19 @@ import type {
   RefreshFeaturesOptions,
   ApiHost,
   ClientKey,
+  Exclusion,
 } from "./types/growthbook";
 import type { ConditionInterface } from "./types/mongrule";
 import {
   getUrlRegExp,
   isIncluded,
   getBucketRanges,
-  hash,
   chooseVariation,
   getQueryStringOverride,
   inNamespace,
+  biasedHash,
+  hash,
+  inRanges,
 } from "./util";
 import { evalCondition } from "./mongrule";
 import { refreshFeatures, subscribe, unsubscribe } from "./feature-repository";
@@ -409,8 +412,40 @@ export class GrowthBook {
         }
         // Feature value is being forced
         if ("force" in rule) {
-          // Skip if coverage is reduced and user not included
-          if ("coverage" in rule) {
+          // Skip because of exclusion rules
+          if (rule.exclusions && this._isExcluded(rule.exclusions)) {
+            process.env.NODE_ENV !== "production" &&
+              this.log("Skip rule because of exclusion rules", {
+                id,
+                rule,
+              });
+            continue;
+          }
+
+          // Skip because outside of valid range
+          if (rule.ranges) {
+            const { hashValue } = this._getHashAttribute(rule.hashAttribute);
+            const seed = rule.seed;
+            if (!hashValue || !seed) {
+              process.env.NODE_ENV !== "production" &&
+                this.log("Skip rule because of missing seed or hashAttribute", {
+                  id,
+                  rule,
+                });
+              continue;
+            }
+            const n = hash(seed + hashValue);
+            if (!inRanges(n, rule.ranges)) {
+              process.env.NODE_ENV !== "production" &&
+                this.log("Skip rule because not included in rollout", {
+                  id,
+                  rule,
+                });
+              continue;
+            }
+          }
+          // Skip if coverage is reduced and user not included (deprecated)
+          else if ("coverage" in rule) {
             const { hashValue } = this._getHashAttribute(rule.hashAttribute);
             if (!hashValue) {
               process.env.NODE_ENV !== "production" &&
@@ -420,7 +455,7 @@ export class GrowthBook {
                 });
               continue;
             }
-            const n = hash(hashValue + id);
+            const n = biasedHash(hashValue + id);
             if (n > (rule.coverage as number)) {
               process.env.NODE_ENV !== "production" &&
                 this.log("Skip rule because of coverage", {
@@ -439,24 +474,35 @@ export class GrowthBook {
 
           return this._getFeatureResult(id, rule.force as T, "force", rule.id);
         }
-        if (!rule.variations) {
+
+        const exp: Experiment<T> = {
+          key: rule.key || id,
+          seed: rule.seed,
+          exclusions: rule.exclusions,
+          hashAttribute: rule.hashAttribute,
+          name: rule.name,
+          phase: rule.phase,
+        };
+        // New style experiment rule
+        if (rule.variants) {
+          exp.variants = rule.variants;
+        }
+        // Old style experiment rule with deprecated fields
+        else if (rule.variations) {
+          if ("coverage" in rule) exp.coverage = rule.coverage;
+          if (rule.weights) exp.weights = rule.weights;
+          if (rule.namespace) exp.namespace = rule.namespace;
+        }
+        // Rule is neither a "force value", "rollout", or "experiment" rule
+        // This should never happen
+        else {
           process.env.NODE_ENV !== "production" &&
             this.log("Skip invalid rule", {
               id,
               rule,
             });
-
           continue;
         }
-        // For experiment rules, run an experiment
-        const exp: Experiment<T> = {
-          variations: rule.variations as [T, T, ...T[]],
-          key: rule.key || id,
-        };
-        if ("coverage" in rule) exp.coverage = rule.coverage;
-        if (rule.weights) exp.weights = rule.weights;
-        if (rule.hashAttribute) exp.hashAttribute = rule.hashAttribute;
-        if (rule.namespace) exp.namespace = rule.namespace;
 
         // Only return a value if the user is part of the experiment
         const res = this._run(exp, id);
@@ -492,25 +538,60 @@ export class GrowthBook {
     return evalCondition(this.getAttributes(), condition);
   }
 
+  private _getVariantValues<T>(exp: Experiment<T>): T[] {
+    return exp.variants
+      ? exp.variants.map((v) => v.value)
+      : exp.variations
+      ? exp.variations
+      : [];
+  }
+
+  private _pickVariation<T>(
+    experiment: Experiment<T>,
+    hashValue: string
+  ): [number, number] {
+    const seed = experiment.seed || experiment.key;
+
+    if (experiment.variants) {
+      const n = hash(seed + hashValue);
+      for (let i = 0; i < experiment.variants.length; i++) {
+        if (inRanges(n, experiment.variants[i].ranges)) {
+          return [i, n];
+        }
+      }
+      return [-1, n];
+    } else if (experiment.variations) {
+      const ranges = getBucketRanges(
+        experiment.variations.length,
+        experiment.coverage ?? 1,
+        experiment.weights
+      );
+      const n = biasedHash(hashValue + seed);
+      return [chooseVariation(n, ranges), n];
+    } else {
+      return [-1, 0];
+    }
+  }
+
   private _run<T>(
     experiment: Experiment<T>,
     featureId: string | null
   ): Result<T> {
     const key = experiment.key;
-    const numVariations = experiment.variations.length;
+    const numVariations = this._getVariantValues(experiment).length;
 
     // 1. If experiment has less than 2 variations, return immediately
     if (numVariations < 2) {
       process.env.NODE_ENV !== "production" &&
         this.log("Invalid experiment", { id: key });
-      return this._getResult(experiment, -1, false, featureId);
+      return this._getResult(experiment, -1, 0, featureId);
     }
 
     // 2. If the context is disabled, return immediately
     if (this._ctx.enabled === false) {
       process.env.NODE_ENV !== "production" &&
         this.log("Context disabled", { id: key });
-      return this._getResult(experiment, -1, false, featureId);
+      return this._getResult(experiment, -1, 0, featureId);
     }
 
     // 2.5. Merge in experiment overrides from the context
@@ -528,7 +609,7 @@ export class GrowthBook {
           id: key,
           variation: qsOverride,
         });
-      return this._getResult(experiment, qsOverride, false, featureId);
+      return this._getResult(experiment, qsOverride, 0, featureId);
     }
 
     // 4. If a variation is forced in the context, return the forced variation
@@ -539,7 +620,7 @@ export class GrowthBook {
           id: key,
           variation,
         });
-      return this._getResult(experiment, variation, false, featureId);
+      return this._getResult(experiment, variation, 0, featureId);
     }
 
     // 5. Exclude if a draft experiment or not active
@@ -548,7 +629,7 @@ export class GrowthBook {
         this.log("Skip because inactive", {
           id: key,
         });
-      return this._getResult(experiment, -1, false, featureId);
+      return this._getResult(experiment, -1, 0, featureId);
     }
 
     // 6. Get the hash attribute and return if empty
@@ -558,25 +639,38 @@ export class GrowthBook {
         this.log("Skip because missing hashAttribute", {
           id: key,
         });
-      return this._getResult(experiment, -1, false, featureId);
+      return this._getResult(experiment, -1, 0, featureId);
     }
 
-    // 7. Exclude if user not in experiment.namespace
-    if (experiment.namespace && !inNamespace(hashValue, experiment.namespace)) {
+    // 7. Exclusion rules
+    if (experiment.exclusions && this._isExcluded(experiment.exclusions)) {
+      process.env.NODE_ENV !== "production" &&
+        this.log("Skip because of exclusion rules", {
+          id: key,
+        });
+      return this._getResult(experiment, -1, 0, featureId);
+    }
+
+    // 7.1. Exclude if user not in experiment.namespace
+    if (
+      !experiment.exclusions &&
+      experiment.namespace &&
+      !inNamespace(hashValue, experiment.namespace)
+    ) {
       process.env.NODE_ENV !== "production" &&
         this.log("Skip because of namespace", {
           id: key,
         });
-      return this._getResult(experiment, -1, false, featureId);
+      return this._getResult(experiment, -1, 0, featureId);
     }
 
-    // 7.5. Exclude if experiment.include returns false or throws
+    // 7.2. Exclude if experiment.include returns false or throws
     if (experiment.include && !isIncluded(experiment.include)) {
       process.env.NODE_ENV !== "production" &&
         this.log("Skip because of include function", {
           id: key,
         });
-      return this._getResult(experiment, -1, false, featureId);
+      return this._getResult(experiment, -1, 0, featureId);
     }
 
     // 8. Exclude if condition is false
@@ -585,7 +679,7 @@ export class GrowthBook {
         this.log("Skip because of condition", {
           id: key,
         });
-      return this._getResult(experiment, -1, false, featureId);
+      return this._getResult(experiment, -1, 0, featureId);
     }
 
     // 8.1. Exclude if user is not in a required group
@@ -597,7 +691,7 @@ export class GrowthBook {
         this.log("Skip because of groups", {
           id: key,
         });
-      return this._getResult(experiment, -1, false, featureId);
+      return this._getResult(experiment, -1, 0, featureId);
     }
 
     // 8.2. Exclude if not on a targeted url
@@ -606,17 +700,11 @@ export class GrowthBook {
         this.log("Skip because of url", {
           id: key,
         });
-      return this._getResult(experiment, -1, false, featureId);
+      return this._getResult(experiment, -1, 0, featureId);
     }
 
-    // 9. Get bucket ranges and choose variation
-    const ranges = getBucketRanges(
-      numVariations,
-      experiment.coverage ?? 1,
-      experiment.weights
-    );
-    const n = hash(hashValue + key);
-    const assigned = chooseVariation(n, ranges);
+    // 9. Choose variation
+    const [assigned, bucket] = this._pickVariation(experiment, hashValue);
 
     // 10. Return if not in experiment
     if (assigned < 0) {
@@ -624,7 +712,7 @@ export class GrowthBook {
         this.log("Skip because of coverage", {
           id: key,
         });
-      return this._getResult(experiment, -1, false, featureId);
+      return this._getResult(experiment, -1, 0, featureId);
     }
 
     // 11. Experiment has a forced variation
@@ -634,12 +722,7 @@ export class GrowthBook {
           id: key,
           variation: experiment.force,
         });
-      return this._getResult(
-        experiment,
-        experiment.force ?? -1,
-        false,
-        featureId
-      );
+      return this._getResult(experiment, experiment.force ?? -1, 0, featureId);
     }
 
     // 12. Exclude if in QA mode
@@ -648,7 +731,7 @@ export class GrowthBook {
         this.log("Skip because QA mode", {
           id: key,
         });
-      return this._getResult(experiment, -1, false, featureId);
+      return this._getResult(experiment, -1, 0, featureId);
     }
 
     // 12.5. Exclude if experiment is stopped
@@ -657,11 +740,11 @@ export class GrowthBook {
         this.log("Skip because stopped", {
           id: key,
         });
-      return this._getResult(experiment, -1, false, featureId);
+      return this._getResult(experiment, -1, 0, featureId);
     }
 
     // 13. Build the result object
-    const result = this._getResult(experiment, assigned, true, featureId);
+    const result = this._getResult(experiment, assigned, bucket, featureId);
 
     // 14. Fire the tracking callback
     this._track(experiment, result);
@@ -715,6 +798,21 @@ export class GrowthBook {
     return experiment;
   }
 
+  private _isExcluded(exclusions: Exclusion[]) {
+    for (const exclusion of exclusions) {
+      const { hashValue } = this._getHashAttribute(exclusion.attribute);
+      if (!hashValue) {
+        return true;
+      }
+
+      const n = hash(exclusion.seed + hashValue);
+      if (!inRanges(n, exclusion.ranges)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   private _getHashAttribute(attr?: string) {
     const hashAttribute = attr || "id";
 
@@ -733,12 +831,14 @@ export class GrowthBook {
   private _getResult<T>(
     experiment: Experiment<T>,
     variationIndex: number,
-    hashUsed: boolean,
+    n: number,
     featureId: string | null
   ): Result<T> {
+    const values = this._getVariantValues(experiment);
+
     let inExperiment = true;
     // If assigned variation is not valid, use the baseline and mark the user as not in the experiment
-    if (variationIndex < 0 || variationIndex >= experiment.variations.length) {
+    if (variationIndex < 0 || variationIndex >= values.length) {
       variationIndex = 0;
       inExperiment = false;
     }
@@ -747,12 +847,17 @@ export class GrowthBook {
       experiment.hashAttribute
     );
 
+    const variant = experiment.variants && experiment.variants[variationIndex];
+
     return {
       featureId,
       inExperiment,
-      hashUsed,
+      hashUsed: n > 0,
       variationId: variationIndex,
-      value: experiment.variations[variationIndex],
+      variationKey: variant ? variant.key : undefined,
+      variationName: variant ? variant.name : undefined,
+      value: values[variationIndex],
+      bucket: n,
       hashAttribute,
       hashValue,
     };

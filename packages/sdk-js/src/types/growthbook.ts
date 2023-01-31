@@ -13,13 +13,65 @@ export type FeatureRule<T = any> = {
   id?: string;
   condition?: ConditionInterface;
   force?: T;
-  variations?: T[];
-  weights?: number[];
-  key?: string;
   hashAttribute?: string;
+  key?: string;
+  seed?: string;
+  exclusions?: Exclusion[];
+  ranges?: Ranges;
+  track?: TrackData;
+  name?: string;
+  phase?: string;
+  variants?: Variant<T>[];
+
+  /**
+   * @deprecated
+   */
+  variations?: T[];
+  /**
+   * @deprecated
+   */
+  weights?: number[];
+  /**
+   * @deprecated
+   */
   coverage?: number;
+  /**
+   * @deprecated
+   */
   namespace?: [string, number, number];
 };
+
+export type Range = [number, number];
+export type Ranges = Range[];
+
+export interface Exclusion {
+  seed: string;
+  ranges: Ranges;
+  attribute?: string;
+  shouldTrack?: boolean;
+}
+
+export interface Variant<T> {
+  value: T;
+  ranges: Ranges;
+  key?: string;
+  name?: string;
+}
+
+export interface TrackData {
+  hashAttribute: string;
+  hashValue: string;
+  bucket: number;
+  value: any;
+
+  experimentId: string;
+  experimentName?: string;
+  phase?: string;
+
+  variationIndex: number;
+  variationId?: string;
+  variationName?: string;
+}
 
 export interface FeatureDefinition<T = any> {
   defaultValue?: T;
@@ -47,20 +99,43 @@ export type ExperimentStatus = "draft" | "running" | "stopped";
 
 export type Experiment<T> = {
   key: string;
-  variations: [T, T, ...T[]];
+  /**
+   * @deprecated
+   */
+  variations?: [T, T, ...T[]];
+  /**
+   * @deprecated
+   */
   weights?: number[];
   condition?: ConditionInterface;
+  /**
+   * @deprecated
+   */
   coverage?: number;
   include?: () => boolean;
+  /**
+   * @deprecated
+   */
   namespace?: [string, number, number];
   force?: number;
+  exclusions?: Exclusion[];
+  variants?: Variant<T>[];
+  seed?: string;
+  name?: string;
+  phase?: string;
   hashAttribute?: string;
   active?: boolean;
-  /* @deprecated */
+  /**
+   * @deprecated
+   */
   status?: ExperimentStatus;
-  /* @deprecated */
+  /**
+   * @deprecated
+   */
   url?: RegExp;
-  /* @deprecated */
+  /**
+   * @deprecated
+   */
   groups?: string[];
 };
 
@@ -79,6 +154,9 @@ export type ExperimentOverride = {
 export interface Result<T> {
   value: T;
   variationId: number;
+  variationKey?: string;
+  variationName?: string;
+  bucket?: number;
   inExperiment: boolean;
   hashUsed?: boolean;
   hashAttribute: string;
@@ -105,6 +183,7 @@ export interface Context {
   /* @deprecated */
   disableDevTools?: boolean;
   trackingCallback?: (experiment: Experiment<any>, result: Result<any>) => void;
+  onExperimentViewed?: (data: TrackData) => void;
   onFeatureUsage?: (key: string, result: FeatureResult<any>) => void;
   realtimeKey?: string;
   realtimeInterval?: number;
@@ -127,8 +206,6 @@ export type SubscriptionFunction = (
   experiment: Experiment<any>,
   result: Result<any>
 ) => void;
-
-export type VariationRange = [number, number];
 
 export type JSONValue =
   | null

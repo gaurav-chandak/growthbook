@@ -2,13 +2,13 @@
 
 import { Context, Experiment, FeatureResult, GrowthBook } from "../src";
 import { evalCondition } from "../src/mongrule";
-import { VariationRange } from "../src/types/growthbook";
+import { Ranges } from "../src/types/growthbook";
 import {
   chooseVariation,
   getBucketRanges,
   getEqualWeights,
   getQueryStringOverride,
-  hash,
+  biasedHash,
   inNamespace,
 } from "../src/util";
 import cases from "./cases.json";
@@ -24,13 +24,9 @@ type Cases = {
   // name, condition, attribute, result
   evalCondition: [string, any, any, boolean][];
   // name, args ([numVariations, coverage, weights]), result
-  getBucketRange: [
-    string,
-    [number, number, number[] | null],
-    VariationRange[]
-  ][];
+  getBucketRange: [string, [number, number, number[] | null], Ranges][];
   // name, hash, ranges, result
-  chooseVariation: [string, number, VariationRange[], number][];
+  chooseVariation: [string, number, Ranges, number][];
   // name, experiment key, url, numVariations, result
   getQueryStringOverride: [string, string, string, number, number | null][];
   // name, id, namespace, result
@@ -68,7 +64,7 @@ describe("json test suite", () => {
   );
 
   it.each((cases as Cases).hash)("hash[%#] %s", (value, expected) => {
-    expect(hash(value as string)).toEqual(expected);
+    expect(biasedHash(value as string)).toEqual(expected);
   });
 
   it.each((cases as Cases).getBucketRange)(

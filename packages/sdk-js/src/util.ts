@@ -1,4 +1,4 @@
-import { VariationRange } from "./types/growthbook";
+import { Ranges } from "./types/growthbook";
 
 function hashFnv32a(str: string): number {
   let hval = 0x811c9dc5;
@@ -12,8 +12,13 @@ function hashFnv32a(str: string): number {
   return hval >>> 0;
 }
 
-export function hash(str: string): number {
+export function biasedHash(str: string): number {
   return (hashFnv32a(str) % 1000) / 1000;
+}
+
+export function hash(str: string): number {
+  const n = hashFnv32a("" + hashFnv32a(str));
+  return (n % 10000) / 10000;
 }
 
 export function getEqualWeights(n: number): number[] {
@@ -25,11 +30,11 @@ export function inNamespace(
   hashValue: string,
   namespace: [string, number, number]
 ): boolean {
-  const n = hash(hashValue + "__" + namespace[0]);
+  const n = biasedHash(hashValue + "__" + namespace[0]);
   return n >= namespace[1] && n < namespace[2];
 }
 
-export function chooseVariation(n: number, ranges: VariationRange[]): number {
+export function chooseVariation(n: number, ranges: Ranges): number {
   for (let i = 0; i < ranges.length; i++) {
     if (n >= ranges[i][0] && n < ranges[i][1]) {
       return i;
@@ -52,7 +57,7 @@ export function getBucketRanges(
   numVariations: number,
   coverage: number = 1,
   weights?: number[]
-): VariationRange[] {
+): Ranges {
   // Make sure coverage is within bounds
   if (coverage < 0) {
     if (process.env.NODE_ENV !== "production") {
@@ -93,7 +98,7 @@ export function getBucketRanges(
     const start = cumulative;
     cumulative += w;
     return [start, start + coverage * w];
-  }) as VariationRange[];
+  }) as Ranges;
 }
 
 export function getQueryStringOverride(
@@ -130,4 +135,8 @@ export function isIncluded(include: () => boolean) {
     console.error(e);
     return false;
   }
+}
+
+export function inRanges(n: number, ranges: Ranges): boolean {
+  return ranges.some(([start, end]) => n >= start && n < end);
 }
